@@ -1,166 +1,111 @@
-import undetected_chromedriver as uc
 import time
-import sqlite3
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
+import logging as logger
 from bs4 import BeautifulSoup
+import undetected_chromedriver as uc
+from selenium.common.exceptions import WebDriverException
+from db_connection import DatabaseManager
+from product import ProductExtractor
 
+class NeweggScraper:
+    def __init__(self, url: str, db_manager: DatabaseManager):
+        self.url = url
+        self.driver = self._init_driver()
+        self.db = db_manager
+        self.extractor = ProductExtractor()
 
-# Target product URL on Newegg
-URL = "https://www.newegg.com/amd-ryzen-7-9000-series-ryzen-7-9800x3d-granite-ridge-zen-5-socket-am5-desktop-cpu-processor/p/N82E16819113877"
-# SQLite database file name
-DB_FILE = "newegg_data.db"
+    def _init_driver(self):
+        try:
+            options = uc.ChromeOptions()
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            driver = uc.Chrome(version_main=138, options=options)
+            logger.info("Chrome driver initialized.")
+            return driver
+        except WebDriverException as e:
+            logger.critical(f"Failed to initialize Chrome driver: {e}")
+            raise
 
-# Set up Chrome options to reduce bot detection
-options = uc.ChromeOptions()
-options.add_argument("--disable-blink-features=AutomationControlled")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-
-# Launch undetected Chrome driver with forced version 138
-driver = uc.Chrome(version_main=138, options=options)
-
-# Function to load the page and return parsed HTML (BeautifulSoup object)
-def page_source(URL, retries=3):
-    for attempt in range(retries):
-        driver.get(URL)
-        time.sleep(5)
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        
-        # Check if Newegg presents a CAPTCHA
-        title = soup.find("title").text if soup.find("title") else ""
-        if title == "Are you a human?":
-            print(f"CAPTCHA detected on attempt {attempt+1}, retrying...")
-            time.sleep(5)  # wait before retry
-            continue
-        
-        # Wait extra time for page to fully load
-        time.sleep(10)
-        if soup:
-            return soup
-    raise Exception(
-        "Failed to load page after retries (CAPTCHA still present)")
-    
-    
-# Function to scrape product details and save to SQLite
-def scrape_newegg(URL):
-    soup = page_source(URL) # Get page content
-    all_products = []
-    product = {}
-    
-    # --- Main Product Info Extraction ---
-    try:
-        # Extract product title (cut off after first hyphen to remove extra detail)
-        product['title'] = soup.find(
-            "h1", class_="product-title").get_text(strip=True).split("-", 1)[0]
-    except:
-        product['title'] = None
-    try:
-        # Extract product brand from brand element
-        product['brand'] = soup.find(
-            "div", class_="product-view-brand has-brand-store").find("a").get("title")
-    except:
-        product['brand'] = None
-    try:
-        # Extract product price
-        product['price'] = soup.find(
-            "div", class_="row-side").find("div", class_="price-current").get_text(strip=True)
-    except:
-        product['price'] = None
-    try:
-        # Extract star rating
-        product['rating'] = soup.find(
-            "span", class_="item-rating-num").get_text(" ", strip=True).split(" ", 1)[0]
-    except:
-        product['rating'] = None
-    try:
-        # Extract short product description
-        product['description'] = soup.find(
-            "div", class_="product-bullets").get_text(" ", strip=True)
-    except:
-        product['description'] = None
-    all_products.append(product)
-    
-    # --- Extract Similar Products ---
-    try:
-        # Locate the similar products container using XPath (Selenium required here)
-        sim_container = driver.find_element(
-            By.XPATH, '//*[@id="newProductPageContent"]/div/div/div/div[2]/div[2]/div/div[1]/div[4]')
-        # sim_container = soup.find_all("div", class_="product-similar-box")
-        
-        # Find all similar product slides within the carousel
-        items = sim_container.find_all("div", class_="swiper-slide")
-        for item in items:
-            sim = {}
+    def load_page(self, retries=3):
+        for attempt in range(retries):
             try:
-                # Extract title and trim after first hyphen
-                sim['title'] = item.find(
-                    "a", class_="item-title").get_text(strip=True).split("-", 1)[0]
-            except:
-                sim['title'] = None
-            try:
-                # Extract brand by grabbing the first few words from the title (brand not listed separately)
-                full_text = item.find(
-                    "a", class_="item-title").get_text(strip=True)
-                first_four_words = ' '.join(full_text.split()[:4])
-                sim['brand'] = first_four_words
-            except:
-                sim['brand'] = None
-            try:
-                # Extract price
-                sim['price'] = item.find(
-                    "ul", class_="price").find("li", class_="price-current").get_text(strip=True)
-            except:
-                sim['price'] = None
-            try:
-                # Extract rating if available
-                sim['rating'] = item.find(
-                    "span", class_="item-rating-num").get_text(strip=True)
-            except:
-                sim['rating'] = None
-            sim['description'] = None 
-            all_products.append(sim)
-    except:
-        # pass
-        print("product not found")
-        
-    # Save to SQLite 
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    
-    cur.execute("""
-    DROP TABLE IF EXISTS product
-""")
+                self.driver.get(self.url)
+                time.sleep(5)
+                soup = BeautifulSoup(self.driver.page_source, "html.parser")
+                title = soup.find("title").text if soup.find("title") else ""
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS product (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT, brand TEXT, price TEXT,
-            rating TEXT, description TEXT
-        )
-    """)
-    
-    # Insert all product data into the table
-    for p in all_products:
-        cur.execute("""
-            INSERT INTO product (title, brand, price, rating, description)
-            VALUES (?, ?, ?, ?, ?)
-        """, (p['title'], p['brand'], p['price'], p['rating'], p['description']))
-    conn.commit()
-    conn.close()
-    return product
+                if title == "Are you a human?":
+                    logger.warning(f"CAPTCHA detected (attempt {attempt + 1}), retrying...")
+                    time.sleep(5)
+                    continue
 
-# --- MAIN EXECUTION ---
-if __name__ == "__main__":
-    product_info = scrape_newegg(URL)
-    print("Extracted Product Info:")
-    for k, v in product_info.items():
-        print(f"{k}: {v}")
-        
-    # Close browser when done
-    try:
-        driver.close()
-    except:
-        pass
+                time.sleep(10)
+                logger.info("Page loaded successfully.")
+                return soup
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed: {e}")
+                time.sleep(3)
+        raise Exception("Failed to load page after retries.")
+    
+    def extract_similar_products(self, soup):
+        products = []
+        try:
+            # Find the section containing similar products
+            sim_section = soup.find("div", class_="product-similar-box")
+            if not sim_section:
+                logger.warning("Similar products section not found.")
+                return products
+
+            # Look for individual product slides
+            items = sim_section.find_all("div", class_="swiper-slide")
+
+            for item in items:
+                sim = {}
+
+                # Title
+                title_tag = item.find("a", class_="item-title")
+                if title_tag:
+                    title_text = title_tag.get_text(strip=True)
+                    sim['title'] = title_text.split("-", 1)[0]
+                    sim['brand'] = ' '.join(title_text.split()[:4])
+                else:
+                    sim['title'] = sim['brand'] = None
+
+                # Price
+                price_tag = item.find("li", class_="price-current")
+                sim['price'] = price_tag.get_text(strip=True) if price_tag else None
+
+                # Rating
+                rating_tag = item.find("span", class_="item-rating-num")
+                sim['rating'] = rating_tag.get_text(strip=True) if rating_tag else None
+
+                sim['description'] = None
+                products.append(sim)
+
+        except Exception as e:
+            logger.error(f"Error while extracting similar products: {e}")
+
+        return products
+
+
+    def run(self):
+        try:
+            logger.info("Scraping started.")
+            soup = self.load_page()
+            # main_product = self.extract_main_product(soup)
+            main_product =  self.extractor.extract_main_product(soup)
+            similar_products = self.extract_similar_products(soup)
+            all_products = [main_product] + similar_products
+
+            self.db.create_table()
+            self.db.insert_products(all_products)
+
+            logger.info("Main product extracted:")
+            for k, v in main_product.items():
+                logger.info(f"{k}: {v}")
+
+        except Exception as e:
+            logger.critical(f"Scraping failed: {e}")
+        finally:
+            logger.info("Browser closed.")
+            self.driver.quit()
